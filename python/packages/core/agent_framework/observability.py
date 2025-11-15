@@ -4,10 +4,13 @@ import contextlib
 import json
 import logging
 from collections.abc import AsyncIterable, Awaitable, Callable, Generator, Mapping
+from datetime import date, datetime
+from decimal import Decimal
 from enum import Enum
 from functools import wraps
 from time import perf_counter, time_ns
 from typing import TYPE_CHECKING, Any, ClassVar, Final, TypeVar
+from uuid import UUID
 
 from opentelemetry import metrics, trace
 from opentelemetry.semconv_ai import GenAISystem, Meters, SpanAttributes
@@ -1447,6 +1450,44 @@ def _capture_messages(
         span.set_attribute(OtelAttr.SYSTEM_INSTRUCTIONS, json.dumps(otel_sys_instructions))
 
 
+def _telemetry_json_serializer(obj: Any) -> str:
+    """Custom JSON serializer for OpenTelemetry telemetry data.
+
+    Handles common non-JSON-serializable Python types that may appear in tool results.
+    Only explicitly supported types are converted; unknown types raise TypeError
+    to surface potential issues rather than silently converting to strings.
+
+    Args:
+        obj: The object to serialize
+
+    Returns:
+        String representation suitable for JSON serialization
+
+    Raises:
+        TypeError: If the object type is not explicitly supported
+
+    Supported types:
+        - datetime/date: Converted to ISO 8601 format (e.g., "2025-11-16T10:30:00")
+        - Decimal: Converted to float
+        - UUID: Converted to string representation
+    """
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, date):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return str(obj)  # Keep precision, avoid float rounding
+    if isinstance(obj, UUID):
+        return str(obj)
+
+    # Unknown types should raise TypeError to surface potential issues
+    raise TypeError(
+        f"Object of type {type(obj).__name__} is not JSON serializable. "
+        f"Supported types: datetime, date, Decimal, UUID. "
+        f"Please convert to a supported type before returning from tool functions."
+    )
+
+
 def _to_otel_message(message: "ChatMessage") -> dict[str, Any]:
     """Create a otel representation of a message."""
     return {"role": message.role.value, "parts": [_to_otel_part(content) for content in message.contents]}
@@ -1461,7 +1502,7 @@ def _to_otel_part(content: "Contents") -> dict[str, Any] | None:
             return {"type": "tool_call", "id": content.call_id, "name": content.name, "arguments": content.arguments}
         case "function_result":
             response: Any | None = None
-            if content.result:
+            if content.result is not None:
                 if isinstance(content.result, list):
                     res: list[Any] = []
                     for item in content.result:  # type: ignore
@@ -1472,10 +1513,13 @@ def _to_otel_part(content: "Contents") -> dict[str, Any] | None:
                         elif isinstance(item, BaseModel):
                             res.append(item.model_dump(exclude_none=True))
                         else:
-                            res.append(json.dumps(item))
-                    response = json.dumps(res)
+                            # Keep item as-is; custom serializer will handle it during final json.dumps()
+                            res.append(item)
+                    # Serialize the final list with custom serializer
+                    response = json.dumps(res, default=_telemetry_json_serializer)
                 else:
-                    response = json.dumps(content.result)
+                    # Use custom serializer to handle datetime, Decimal, UUID, etc.
+                    response = json.dumps(content.result, default=_telemetry_json_serializer)
             return {"type": "tool_call_response", "id": content.call_id, "response": response}
         case _:
             # GenericPart in otel output messages json spec.
